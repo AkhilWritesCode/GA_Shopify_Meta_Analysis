@@ -997,6 +997,8 @@ def render_analysis_section(ga_data, shopify_data, meta_data, section_id):
         if non_null_rows < total_rows:
             st.info(f"Note: {total_rows - non_null_rows} rows have missing region values (out of {total_rows} total)")
     
+    st.info("ℹ️ Region names will be normalized (lowercase, spaces removed) during analysis to ensure matching across datasets")
+    
     if len(available_regions) <= 10:
         st.write(", ".join(available_regions))
     else:
@@ -1078,19 +1080,45 @@ def render_analysis_section(ga_data, shopify_data, meta_data, section_id):
                 st.error("Please add at least one campaign week")
                 return
             
+            # Normalize region columns across all datasets
+            st.info("🔄 Normalizing region data across datasets...")
+            
+            # Create copies of the data to avoid modifying the original cached data
+            ga_data_normalized = ga_data.copy()
+            shopify_data_normalized = shopify_data.copy()
+            meta_data_normalized = meta_data.copy() if meta_data is not None and not meta_data.empty else None
+            
+            # Normalize GA region column: lowercase and remove all spaces
+            if region_column in ga_data_normalized.columns:
+                ga_data_normalized[region_column] = ga_data_normalized[region_column].astype(str).str.lower().str.replace(r'\s+', '', regex=True)
+            
+            # Normalize Shopify region column: lowercase and remove all spaces
+            if shopify_region_column in shopify_data_normalized.columns:
+                shopify_data_normalized[shopify_region_column] = shopify_data_normalized[shopify_region_column].astype(str).str.lower().str.replace(r'\s+', '', regex=True)
+            
+            # Normalize Meta region column: lowercase and remove all spaces (if Meta data exists)
+            if meta_data_normalized is not None and meta_region_column and meta_region_column in meta_data_normalized.columns:
+                meta_data_normalized[meta_region_column] = meta_data_normalized[meta_region_column].astype(str).str.lower().str.replace(r'\s+', '', regex=True)
+            
+            # Normalize selected regions and control regions to match
+            selected_regions_normalized = [str(r).lower().replace(' ', '') for r in selected_regions]
+            control_regions_normalized = [str(r).lower().replace(' ', '') for r in control_regions]
+            
+            st.success("✅ Region data normalized successfully!")
+            
             try:
                 results, base_divisor, conn = create_analysis_with_duckdb(
-                    ga_data, shopify_data, meta_data, selected_regions,
+                    ga_data_normalized, shopify_data_normalized, meta_data_normalized, selected_regions_normalized,
                     base_week_start, base_week_end,
-                    campaign_weeks, control_regions, google_sources, 
+                    campaign_weeks, control_regions_normalized, google_sources, 
                     base_week_method, campaign_display_method, campaign_calculation_method,
                     region_column, shopify_region_column, meta_region_column
                 )
                 
                 # Process control regions if any
-                if control_regions:
+                if control_regions_normalized:
                     control_result = process_control_regions_duckdb(
-                        conn, control_regions, google_sources,
+                        conn, control_regions_normalized, google_sources,
                         base_week_start, base_week_end,
                         campaign_weeks, region_column, shopify_region_column, meta_region_column,
                         base_divisor, campaign_display_method, campaign_calculation_method
