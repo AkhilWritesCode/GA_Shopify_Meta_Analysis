@@ -16,78 +16,58 @@ def generate_analysis_output(df, analysis, idx, conn):
     meta_sources = ["fbig", "fb social", "facebook organic", "instagram organic", 
                   "ig social", "instagram", "ig", "meta"]
     
-    def calculate_share_and_count(start_date, end_date, dma, cluster_sources):
-        if not cluster_sources:
-            return 0, 0
-        sources_str = "', '".join(cluster_sources)
-        query = f"""
-        WITH filtered AS (
-            SELECT DISTINCT JourneyName
-            FROM campaign_data
-            WHERE entry_timestamp::DATE >= '{start_date}'
-            AND entry_timestamp::DATE <= '{end_date}'
-            AND DMA = '{dma}'
-        ),
-        total AS (
-            SELECT COUNT(*) as total_count
-            FROM filtered
-        ),
-        cluster AS (
-            SELECT COUNT(DISTINCT JourneyName) as cluster_count
-            FROM campaign_data
-            WHERE entry_timestamp::DATE >= '{start_date}'
-            AND entry_timestamp::DATE <= '{end_date}'
-            AND DMA = '{dma}'
-            AND source IN ('{sources_str}')
-        )
-        SELECT 
-            CASE WHEN total.total_count = 0 THEN 0 
-            ELSE cluster.cluster_count::FLOAT / total.total_count::FLOAT 
-            END as share,
-            cluster.cluster_count as count
-        FROM total, cluster
-        """
-        result = conn.execute(query).fetchone()
-        return (result[0], result[1]) if result else (0, 0)
-    
-    def calculate_exclusive_share_and_count(start_date, end_date, dma, cluster_sources, exclude_sources):
-        if not cluster_sources:
-            return 0, 0
-        sources_str = "', '".join(cluster_sources)
-        exclude_str = "', '".join(exclude_sources) if exclude_sources else ""
+    def calculate_exclusive_shares_optimized(start_date, end_date, dma_list, clusters_dict, counted_sources):
+        """Calculate exclusive shares with priority ordering"""
+        # If multiple DMAs, combine them
+        if isinstance(dma_list, list):
+            dma_str = "', '".join(dma_list)
+            dma_condition = f"DMA IN ('{dma_str}')"
+        else:
+            dma_condition = f"DMA = '{dma_list}'"
         
-        exclude_clause = f"AND JourneyName NOT IN (SELECT DISTINCT JourneyName FROM campaign_data WHERE entry_timestamp::DATE >= '{start_date}' AND entry_timestamp::DATE <= '{end_date}' AND DMA = '{dma}' AND source IN ('{exclude_str}'))" if exclude_sources else ""
+        results = {}
+        current_excluded = list(counted_sources)
         
-        query = f"""
-        WITH filtered AS (
-            SELECT DISTINCT JourneyName
-            FROM campaign_data
-            WHERE entry_timestamp::DATE >= '{start_date}'
-            AND entry_timestamp::DATE <= '{end_date}'
-            AND DMA = '{dma}'
-        ),
-        total AS (
-            SELECT COUNT(*) as total_count
-            FROM filtered
-        ),
-        cluster AS (
-            SELECT COUNT(DISTINCT JourneyName) as cluster_count
-            FROM campaign_data
-            WHERE entry_timestamp::DATE >= '{start_date}'
-            AND entry_timestamp::DATE <= '{end_date}'
-            AND DMA = '{dma}'
-            AND source IN ('{sources_str}')
-            {exclude_clause}
-        )
-        SELECT 
-            CASE WHEN total.total_count = 0 THEN 0 
-            ELSE cluster.cluster_count::FLOAT / total.total_count::FLOAT 
-            END as share,
-            cluster.cluster_count as count
-        FROM total, cluster
-        """
-        result = conn.execute(query).fetchone()
-        return (result[0], result[1]) if result else (0, 0)
+        for cluster_name, cluster_sources in clusters_dict.items():
+            sources_str = "', '".join(cluster_sources)
+            
+            if current_excluded:
+                exclude_str = "', '".join(current_excluded)
+                exclude_clause = f"AND source NOT IN ('{exclude_str}')"
+            else:
+                exclude_clause = ""
+            
+            query = f"""
+            WITH journey_data AS (
+                SELECT DISTINCT JourneyName
+                FROM campaign_data
+                WHERE entry_timestamp::DATE >= '{start_date}'
+                AND entry_timestamp::DATE <= '{end_date}'
+                AND {dma_condition}
+            ),
+            cluster_journeys AS (
+                SELECT DISTINCT JourneyName
+                FROM campaign_data
+                WHERE entry_timestamp::DATE >= '{start_date}'
+                AND entry_timestamp::DATE <= '{end_date}'
+                AND {dma_condition}
+                AND source IN ('{sources_str}')
+                {exclude_clause}
+            )
+            SELECT 
+                (SELECT COUNT(*) FROM journey_data) as total,
+                (SELECT COUNT(*) FROM cluster_journeys) as cluster_count
+            """
+            
+            result = conn.execute(query).fetchone()
+            if result:
+                total, count = result
+                share = count / total if total > 0 else 0
+                results[cluster_name] = {'share': share, 'count': count}
+            
+            current_excluded.extend(cluster_sources)
+        
+        return results, current_excluded
     
     # Extract analysis config
     clusters = analysis['clusters']
@@ -96,177 +76,142 @@ def generate_analysis_output(df, analysis, idx, conn):
     base_end = analysis['base_end']
     base_weeks = analysis['base_weeks']
     target_dmas = analysis['target_dmas']
-    control_dmas = analysis['control_dmas']
+    control_dmas = analysis.get('control_dmas', [])
+    use_control = analysis.get('use_control', False)
+    combine_target = analysis.get('combine_target', False)
     
-    # For each target DMA
-    for target_dma in target_dmas:
-        st.write(f"### {target_dma}")
+    # Pre-calculate all sources
+    all_sources = df['source'].unique().tolist()
+    
+    # Determine how to process target DMAs
+    if combine_target:
+        target_groups = [target_dmas]  # Single group with all DMAs
+        target_labels = [" + ".join(target_dmas)]
+    else:
+        target_groups = [[dma] for dma in target_dmas]  # Separate group for each DMA
+        target_labels = target_dmas
+    
+    # For each target DMA or group
+    for target_group, target_label in zip(target_groups, target_labels):
+        st.write(f"### {target_label}")
         
         rows = []
         
-        # Base period
+        # Base period - Target
         base_row = {'Share of journeys': 'Base'}
-        counted_sources = []
         
-        # Meta
-        meta_share, meta_count = calculate_share_and_count(base_start, base_end, target_dma, meta_sources)
-        base_row['Meta'] = f"{meta_share:.2%} ({meta_count})"
-        counted_sources.extend(meta_sources)
+        # Calculate Meta and clusters
+        base_results, counted_sources = calculate_exclusive_shares_optimized(
+            base_start, base_end, target_group, 
+            {'Meta': meta_sources, **clusters}, 
+            []
+        )
+        
+        base_row['Meta'] = f"{base_results['Meta']['share']:.2%} ({base_results['Meta']['count']})"
         
         # Other clusters
-        for cluster_name, cluster_sources in clusters.items():
-            target_share, target_count = calculate_exclusive_share_and_count(
-                base_start, base_end, target_dma, cluster_sources, counted_sources
-            )
-            base_row[cluster_name] = f"{target_share:.2%} ({target_count})"
-            counted_sources.extend(cluster_sources)
+        for cluster_name in clusters.keys():
+            base_row[cluster_name] = f"{base_results[cluster_name]['share']:.2%} ({base_results[cluster_name]['count']})"
         
         # Others
-        all_sources = df['source'].unique().tolist()
         others_sources = [s for s in all_sources if s not in counted_sources]
-        others_share, others_count = calculate_share_and_count(
-            base_start, base_end, target_dma, others_sources
-        ) if others_sources else (0, 0)
-        base_row['Others'] = f"{others_share:.2%} ({others_count})"
+        if others_sources:
+            others_results, _ = calculate_exclusive_shares_optimized(
+                base_start, base_end, target_group,
+                {'Others': others_sources},
+                counted_sources
+            )
+            base_row['Others'] = f"{others_results['Others']['share']:.2%} ({others_results['Others']['count']})"
+        else:
+            base_row['Others'] = "0.00% (0)"
         
         rows.append(base_row)
         
-        # Campaign weeks
+        # Campaign weeks - Target
         for camp_name, camp_data in campaign_weeks.items():
             camp_row = {'Share of journeys': camp_name}
-            counted_sources = []
             
-            # Meta
-            meta_share, meta_count = calculate_share_and_count(
-                camp_data['start'], camp_data['end'], target_dma, meta_sources
+            camp_results, counted_sources = calculate_exclusive_shares_optimized(
+                camp_data['start'], camp_data['end'], target_group,
+                {'Meta': meta_sources, **clusters},
+                []
             )
-            camp_row['Meta'] = f"{meta_share:.2%} ({meta_count})"
-            counted_sources.extend(meta_sources)
             
-            # Other clusters
-            for cluster_name, cluster_sources in clusters.items():
-                target_share, target_count = calculate_exclusive_share_and_count(
-                    camp_data['start'], camp_data['end'], target_dma, cluster_sources, counted_sources
-                )
-                camp_row[cluster_name] = f"{target_share:.2%} ({target_count})"
-                counted_sources.extend(cluster_sources)
+            camp_row['Meta'] = f"{camp_results['Meta']['share']:.2%} ({camp_results['Meta']['count']})"
+            
+            for cluster_name in clusters.keys():
+                camp_row[cluster_name] = f"{camp_results[cluster_name]['share']:.2%} ({camp_results[cluster_name]['count']})"
             
             # Others
-            others_share, others_count = calculate_share_and_count(
-                camp_data['start'], camp_data['end'], target_dma, others_sources
-            ) if others_sources else (0, 0)
-            camp_row['Others'] = f"{others_share:.2%} ({others_count})"
+            if others_sources:
+                others_results, _ = calculate_exclusive_shares_optimized(
+                    camp_data['start'], camp_data['end'], target_group,
+                    {'Others': others_sources},
+                    counted_sources
+                )
+                camp_row['Others'] = f"{others_results['Others']['share']:.2%} ({others_results['Others']['count']})"
+            else:
+                camp_row['Others'] = "0.00% (0)"
             
             rows.append(camp_row)
         
-        # Control average row for Base
-        control_row = {'Share of journeys': 'Control (Avg)'}
-        counted_sources = []
-        
-        # Meta
-        control_shares = []
-        control_counts = []
-        for control_dma in control_dmas:
-            control_share, control_count = calculate_share_and_count(
-                base_start, base_end, control_dma, meta_sources
+        # Control rows (only if use_control is True)
+        if use_control and control_dmas:
+            # Control average - Base
+            control_row = {'Share of journeys': 'Control (Avg)'}
+            
+            # Calculate for all control DMAs combined
+            ctrl_results, _ = calculate_exclusive_shares_optimized(
+                base_start, base_end, control_dmas,
+                {'Meta': meta_sources, **clusters},
+                []
             )
-            control_shares.append(control_share)
-            control_counts.append(control_count)
-        avg_control = sum(control_shares) / len(control_dmas) if control_dmas else 0
-        avg_control = avg_control / base_weeks if base_weeks > 0 else 0
-        avg_count = sum(control_counts) / len(control_dmas) if control_dmas else 0
-        avg_count = avg_count / base_weeks if base_weeks > 0 else 0
-        control_row['Meta'] = f"{avg_control:.2%} ({int(avg_count)})"
-        counted_sources.extend(meta_sources)
-        
-        # Other clusters
-        for cluster_name, cluster_sources in clusters.items():
-            control_shares = []
-            control_counts = []
-            for control_dma in control_dmas:
-                control_share, control_count = calculate_exclusive_share_and_count(
-                    base_start, base_end, control_dma, cluster_sources, counted_sources
-                )
-                control_shares.append(control_share)
-                control_counts.append(control_count)
-            avg_control = sum(control_shares) / len(control_dmas) if control_dmas else 0
-            avg_control = avg_control / base_weeks if base_weeks > 0 else 0
-            avg_count = sum(control_counts) / len(control_dmas) if control_dmas else 0
-            avg_count = avg_count / base_weeks if base_weeks > 0 else 0
-            control_row[cluster_name] = f"{avg_control:.2%} ({int(avg_count)})"
-            counted_sources.extend(cluster_sources)
-        
-        # Others
-        control_shares = []
-        control_counts = []
-        for control_dma in control_dmas:
-            control_share, control_count = calculate_share_and_count(
-                base_start, base_end, control_dma, others_sources
-            ) if others_sources else (0, 0)
-            control_shares.append(control_share)
-            control_counts.append(control_count)
-        avg_control = sum(control_shares) / len(control_dmas) if control_dmas else 0
-        avg_control = avg_control / base_weeks if base_weeks > 0 else 0
-        avg_count = sum(control_counts) / len(control_dmas) if control_dmas else 0
-        avg_count = avg_count / base_weeks if base_weeks > 0 else 0
-        control_row['Others'] = f"{avg_control:.2%} ({int(avg_count)})"
-        
-        rows.append(control_row)
-        
-        # Campaign weeks control averages
-        for camp_name, camp_data in campaign_weeks.items():
-            camp_control_row = {'Share of journeys': f'Control (Avg) - {camp_name}'}
-            counted_sources = []
             
-            # Meta
-            control_shares = []
-            control_counts = []
-            for control_dma in control_dmas:
-                control_share, control_count = calculate_share_and_count(
-                    camp_data['start'], camp_data['end'], control_dma, meta_sources
-                )
-                control_shares.append(control_share)
-                control_counts.append(control_count)
-            avg_control = sum(control_shares) / len(control_dmas) if control_dmas else 0
-            avg_control = avg_control / camp_data['weeks'] if camp_data['weeks'] > 0 else 0
-            avg_count = sum(control_counts) / len(control_dmas) if control_dmas else 0
-            avg_count = avg_count / camp_data['weeks'] if camp_data['weeks'] > 0 else 0
-            camp_control_row['Meta'] = f"{avg_control:.2%} ({int(avg_count)})"
-            counted_sources.extend(meta_sources)
+            control_row['Meta'] = f"{ctrl_results['Meta']['share']:.2%} ({ctrl_results['Meta']['count']})"
             
-            # Other clusters
-            for cluster_name, cluster_sources in clusters.items():
-                control_shares = []
-                control_counts = []
-                for control_dma in control_dmas:
-                    control_share, control_count = calculate_exclusive_share_and_count(
-                        camp_data['start'], camp_data['end'], control_dma, cluster_sources, counted_sources
-                    )
-                    control_shares.append(control_share)
-                    control_counts.append(control_count)
-                avg_control = sum(control_shares) / len(control_dmas) if control_dmas else 0
-                avg_control = avg_control / camp_data['weeks'] if camp_data['weeks'] > 0 else 0
-                avg_count = sum(control_counts) / len(control_dmas) if control_dmas else 0
-                avg_count = avg_count / camp_data['weeks'] if camp_data['weeks'] > 0 else 0
-                camp_control_row[cluster_name] = f"{avg_control:.2%} ({int(avg_count)})"
-                counted_sources.extend(cluster_sources)
+            for cluster_name in clusters.keys():
+                control_row[cluster_name] = f"{ctrl_results[cluster_name]['share']:.2%} ({ctrl_results[cluster_name]['count']})"
             
             # Others
-            control_shares = []
-            control_counts = []
-            for control_dma in control_dmas:
-                control_share, control_count = calculate_share_and_count(
-                    camp_data['start'], camp_data['end'], control_dma, others_sources
-                ) if others_sources else (0, 0)
-                control_shares.append(control_share)
-                control_counts.append(control_count)
-            avg_control = sum(control_shares) / len(control_dmas) if control_dmas else 0
-            avg_control = avg_control / camp_data['weeks'] if camp_data['weeks'] > 0 else 0
-            avg_count = sum(control_counts) / len(control_dmas) if control_dmas else 0
-            avg_count = avg_count / camp_data['weeks'] if camp_data['weeks'] > 0 else 0
-            camp_control_row['Others'] = f"{avg_control:.2%} ({int(avg_count)})"
+            if others_sources:
+                others_ctrl_results, _ = calculate_exclusive_shares_optimized(
+                    base_start, base_end, control_dmas,
+                    {'Others': others_sources},
+                    counted_sources
+                )
+                control_row['Others'] = f"{others_ctrl_results['Others']['share']:.2%} ({others_ctrl_results['Others']['count']})"
+            else:
+                control_row['Others'] = "0.00% (0)"
             
-            rows.append(camp_control_row)
+            rows.append(control_row)
+            
+            # Control average - Campaign weeks
+            for camp_name, camp_data in campaign_weeks.items():
+                camp_control_row = {'Share of journeys': f'Control (Avg) - {camp_name}'}
+                
+                ctrl_results, _ = calculate_exclusive_shares_optimized(
+                    camp_data['start'], camp_data['end'], control_dmas,
+                    {'Meta': meta_sources, **clusters},
+                    []
+                )
+                
+                camp_control_row['Meta'] = f"{ctrl_results['Meta']['share']:.2%} ({ctrl_results['Meta']['count']})"
+                
+                for cluster_name in clusters.keys():
+                    camp_control_row[cluster_name] = f"{ctrl_results[cluster_name]['share']:.2%} ({ctrl_results[cluster_name]['count']})"
+                
+                # Others
+                if others_sources:
+                    others_ctrl_results, _ = calculate_exclusive_shares_optimized(
+                        camp_data['start'], camp_data['end'], control_dmas,
+                        {'Others': others_sources},
+                        counted_sources
+                    )
+                    camp_control_row['Others'] = f"{others_ctrl_results['Others']['share']:.2%} ({others_ctrl_results['Others']['count']})"
+                else:
+                    camp_control_row['Others'] = "0.00% (0)"
+                
+                rows.append(camp_control_row)
         
         # Display table
         result_df = pd.DataFrame(rows)
@@ -277,11 +222,11 @@ def generate_analysis_output(df, analysis, idx, conn):
         # Download CSV button
         csv = result_df.to_csv(index=False)
         st.download_button(
-            label=f"📥 Download CSV - {target_dma}",
+            label=f"📥 Download CSV - {target_label}",
             data=csv,
-            file_name=f"analysis_{idx+1}_{target_dma.replace(' ', '_')}.csv",
+            file_name=f"analysis_{idx+1}_{target_label.replace(' ', '_').replace('+', 'and')}.csv",
             mime="text/csv",
-            key=f"download_{idx}_{target_dma}"
+            key=f"download_{idx}_{target_label}"
         )
         
         st.divider()
@@ -479,13 +424,11 @@ if st.session_state.get('data_loaded', False):
     
     unique_dmas = sorted(df['DMA'].unique().tolist())
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        target_dmas = st.multiselect("Select Target DMAs", options=unique_dmas, key="target_dmas")
-    
-    with col2:
-        control_dmas = st.multiselect("Select Control DMAs", options=unique_dmas, key="control_dmas")
+    target_dmas = st.multiselect("Select Target DMAs", options=unique_dmas, key="target_dmas")
+    if len(target_dmas) > 1:
+        combine_target = st.checkbox("Combine target DMAs into one analysis", value=False, key="combine_target")
+    else:
+        combine_target = False
     
     st.divider()
     
@@ -495,8 +438,8 @@ if st.session_state.get('data_loaded', False):
             st.error("Please define at least one source cluster")
         elif not st.session_state.campaign_weeks:
             st.error("Please define at least one campaign week")
-        elif not target_dmas or not control_dmas:
-            st.error("Please select both target and control DMAs")
+        elif not target_dmas:
+            st.error("Please select at least one target DMA")
         else:
             # Store analysis configuration
             analysis_config = {
@@ -507,7 +450,9 @@ if st.session_state.get('data_loaded', False):
                 'base_end': base_end,
                 'base_weeks': base_weeks,
                 'target_dmas': target_dmas,
-                'control_dmas': control_dmas
+                'control_dmas': [],
+                'use_control': False,
+                'combine_target': combine_target
             }
             st.session_state.analyses.append(analysis_config)
             st.session_state.analysis_counter += 1
@@ -633,13 +578,11 @@ if st.session_state.get('data_loaded', False):
         
         unique_dmas = sorted(df['DMA'].unique().tolist())
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            target_dmas_new = st.multiselect("Select Target DMAs", options=unique_dmas, key="target_dmas_2")
-        
-        with col2:
-            control_dmas_new = st.multiselect("Select Control DMAs", options=unique_dmas, key="control_dmas_2")
+        target_dmas_new = st.multiselect("Select Target DMAs", options=unique_dmas, key="target_dmas_2")
+        if len(target_dmas_new) > 1:
+            combine_target_new = st.checkbox("Combine target DMAs into one analysis", value=False, key="combine_target_2")
+        else:
+            combine_target_new = False
         
         st.divider()
         
@@ -651,8 +594,8 @@ if st.session_state.get('data_loaded', False):
                     st.error("Please define at least one source cluster")
                 elif not st.session_state.campaign_weeks:
                     st.error("Please define at least one campaign week")
-                elif not target_dmas_new or not control_dmas_new:
-                    st.error("Please select both target and control DMAs")
+                elif not target_dmas_new:
+                    st.error("Please select at least one target DMA")
                 else:
                     # Store analysis configuration
                     analysis_config = {
@@ -663,7 +606,9 @@ if st.session_state.get('data_loaded', False):
                         'base_end': base_end_new,
                         'base_weeks': base_weeks_new,
                         'target_dmas': target_dmas_new,
-                        'control_dmas': control_dmas_new
+                        'control_dmas': [],
+                        'use_control': False,
+                        'combine_target': combine_target_new
                     }
                     st.session_state.analyses.append(analysis_config)
                     st.session_state.analysis_counter += 1
@@ -677,5 +622,4 @@ if st.session_state.get('data_loaded', False):
                 st.rerun()
         
 else:
-    st.info("👆 Please upload a CSV or Excel file to begin")
     st.info("👆 Please upload a CSV or Excel file to begin")
